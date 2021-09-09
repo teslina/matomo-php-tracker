@@ -69,7 +69,7 @@ class MatomoTracker
     const MAX_NUM_ECOMMERCE_ITEM_CATEGORIES = 5;
 
     const DEFAULT_COOKIE_PATH = '/';
-
+    
     private $requestMethod = null;
 
     /**
@@ -161,6 +161,8 @@ class MatomoTracker
 
         $this->outgoingTrackerCookies = array();
         $this->incomingTrackerCookies = array();
+        
+        $this->AsyncTrackOnly   = false;
     }
 
     /**
@@ -590,6 +592,15 @@ class MatomoTracker
         $this->sendImageResponse = false;
     }
 
+    /**
+     * Wenn AsyncTracking aktiviert ist, gibt es kein Return (kann so also z.b. Visitor ID nicht auslesen)
+     * dafür lastet die Funktion so nicht den Server aus und die Production Site bleibt online auch wenn matomo off geht oder überlastet ist
+     */
+    public function enableAsyncTracking()
+    {
+        $this->AsyncTrackOnly = true;
+    }
+    
     /**
      * Fix-up domain
      */
@@ -1594,6 +1605,76 @@ didn't change any existing VisitorId value */
      */
     static public $DEBUG_LAST_REQUESTED_URL = false;
 
+
+    
+        /**
+         * Send a HTTP request, but do not wait for the response
+         *
+         * @param string $method The HTTP method
+         * @param string $url The url (including query string)
+         * @param array $params Added to the URL or request body depending on method
+         * Source: https://stackoverflow.com/questions/14587514/php-fire-and-forget-post-request
+         */
+        public function SendAsyncRequest(string $method, string $url, array $params = []): void
+        {
+            $parts = parse_url($url);
+            if ($parts === false)
+                throw new Exception('Unable to parse URL');
+
+            
+            if ($parts['scheme'] == 'https') {
+                $parts['port'] = 443;
+                $ssl = 'ssl://';
+            } else {
+                $parts['port'] = 80;
+                $ssl = '';
+            }
+            
+            $query = $parts['query'] ?? '';
+            parse_str($query, $queryParts);
+
+        
+            if ($parts['host'] === null)
+                throw new Exception('Unknown host');
+
+            if(!$fp = fsockopen($ssl.$parts['host'], $parts['port'], $errnum, $errstr, 2)){
+            if ($connection === false)
+                throw new Exception('Unable to connect to ' . $parts['host']);
+            }
+            $method = strtoupper($method);
+
+
+            if (!in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
+                $queryParts = $params + $queryParts;
+                $params = [];
+                $path = $parts['path'] . '?' . http_build_query($queryParts);
+            } else {
+                $path = $parts['path'];
+            }
+            
+            $body = http_build_query($queryParts);
+        
+            // Build request
+            fputs($fp, $method." ".$path." HTTP/1.1\r\n");
+            fputs($fp, "Host: ".$parts['host']."\r\n");
+            
+            if( !empty($this->userAgent) ) {
+                fputs($fp, "User-Agent: ". $this->userAgent."\r\n");
+            }
+ 
+            if( !empty($this->acceptLanguage)) {
+                fputs($fp, "Accept-Language: ". $this->acceptLanguage."\r\n");
+            }
+
+            
+            fputs($fp, "Content-type: application/x-www-form-urlencoded\r\n");
+            fputs($fp, "Content-length: ".strlen($body)."\r\n");
+            fputs($fp, "Connection: close\r\n\r\n");
+            fputs($fp, $body. "\r\n\r\n");
+        }    
+    
+    
+    
     /**
      * @ignore
      */
@@ -1650,112 +1731,119 @@ didn't change any existing VisitorId value */
         }
 
         $proxy = $this->getProxy();
-
-        if (function_exists('curl_init') && function_exists('curl_exec')) {
-            $options = array(
-                CURLOPT_URL => $url,
-                CURLOPT_USERAGENT => $this->userAgent,
-                CURLOPT_HEADER => true,
-                CURLOPT_TIMEOUT => $this->requestTimeout,
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_HTTPHEADER => array(
-                    'Accept-Language: ' . $this->acceptLanguage,
-                ),
-            );
-
-            if ($method === 'GET') {
-                $options[CURLOPT_FOLLOWLOCATION] = true;
-            }
-
-            if (defined('PATH_TO_CERTIFICATES_FILE')) {
-                $options[CURLOPT_CAINFO] = PATH_TO_CERTIFICATES_FILE;
-            }
-
-            if (isset($proxy)) {
-                $options[CURLOPT_PROXY] = $proxy;
-            }
-
-            switch ($method) {
-                case 'POST':
-                    $options[CURLOPT_POST] = true;
-                    break;
-                default:
-                    break;
-            }
-
-            // only supports JSON data
-            if (!empty($data) && $forcePostUrlEncoded) {
-                $options[CURLOPT_HTTPHEADER][] = 'Content-Type: application/x-www-form-urlencoded';
-                $options[CURLOPT_POSTFIELDS] = $data;
-                $options[CURLOPT_POST] = true;
-                if (defined('CURL_REDIR_POST_ALL')) {
-                    $options[CURLOPT_POSTREDIR] = CURL_REDIR_POST_ALL;
+        
+        if( $this->AsyncTrackOnly ) {
+            // convert data to array (gegenteil von http_build_query) 
+            parse_str($data, $param);
+            $this->SendAsyncRequest($method, $url , $param);
+            return false; // es gibt keinen output.
+        } else {
+            // continue with default tracking code
+            if (function_exists('curl_init') && function_exists('curl_exec')) {
+                $options = array(
+                    CURLOPT_URL => $url,
+                    CURLOPT_USERAGENT => $this->userAgent,
+                    CURLOPT_HEADER => true,
+                    CURLOPT_TIMEOUT => $this->requestTimeout,
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_HTTPHEADER => array(
+                        'Accept-Language: ' . $this->acceptLanguage,
+                    ),
+                );
+    
+                if ($method === 'GET') {
                     $options[CURLOPT_FOLLOWLOCATION] = true;
                 }
-            } elseif (!empty($data)) {
-                $options[CURLOPT_HTTPHEADER][] = 'Content-Type: application/json';
-                $options[CURLOPT_HTTPHEADER][] = 'Expect:';
-                $options[CURLOPT_POSTFIELDS] = $data;
+    
+                if (defined('PATH_TO_CERTIFICATES_FILE')) {
+                    $options[CURLOPT_CAINFO] = PATH_TO_CERTIFICATES_FILE;
+                }
+    
+                if (isset($proxy)) {
+                    $options[CURLOPT_PROXY] = $proxy;
+                }
+    
+                switch ($method) {
+                    case 'POST':
+                        $options[CURLOPT_POST] = true;
+                        break;
+                    default:
+                        break;
+                }
+    
+                // only supports JSON data
+                if (!empty($data) && $forcePostUrlEncoded) {
+                    $options[CURLOPT_HTTPHEADER][] = 'Content-Type: application/x-www-form-urlencoded';
+                    $options[CURLOPT_POSTFIELDS] = $data;
+                    $options[CURLOPT_POST] = true;
+                    if (defined('CURL_REDIR_POST_ALL')) {
+                        $options[CURLOPT_POSTREDIR] = CURL_REDIR_POST_ALL;
+                        $options[CURLOPT_FOLLOWLOCATION] = true;
+                    }
+                } elseif (!empty($data)) {
+                    $options[CURLOPT_HTTPHEADER][] = 'Content-Type: application/json';
+                    $options[CURLOPT_HTTPHEADER][] = 'Expect:';
+                    $options[CURLOPT_POSTFIELDS] = $data;
+                }
+    
+                if (!empty($this->outgoingTrackerCookies)) {
+                    $options[CURLOPT_COOKIE] = http_build_query($this->outgoingTrackerCookies);
+                    $this->outgoingTrackerCookies = array();
+                }
+    
+                $ch = curl_init();
+                curl_setopt_array($ch, $options);
+                ob_start();
+                $response = @curl_exec($ch);
+                ob_end_clean();
+                $header = '';
+                $content = '';
+                
+                if ($response === false) {
+                    throw new \RuntimeException(curl_error($ch));
+                }
+                
+                if (!empty($response)) {
+                    list($header, $content) = explode("\r\n\r\n", $response, $limitCount = 2);
+                }
+    
+                $this->parseIncomingCookies(explode("\r\n", $header));
+    
+            } elseif (function_exists('stream_context_create')) {
+                $stream_options = array(
+                    'http' => array(
+                        'method' => $method,
+                        'user_agent' => $this->userAgent,
+                        'header' => "Accept-Language: " . $this->acceptLanguage . "\r\n",
+                        'timeout' => $this->requestTimeout,
+                    ),
+                );
+    
+                if (isset($proxy)) {
+                    $stream_options['http']['proxy'] = $proxy;
+                }
+    
+                // only supports JSON data
+                if (!empty($data) && $forcePostUrlEncoded) {
+                    $stream_options['http']['header'] .= "Content-Type: application/x-www-form-urlencoded \r\n";
+                    $stream_options['http']['content'] = $data;
+                } elseif (!empty($data)) {
+                    $stream_options['http']['header'] .= "Content-Type: application/json \r\n";
+                    $stream_options['http']['content'] = $data;
+                }
+    
+                if (!empty($this->outgoingTrackerCookies)) {
+                    $stream_options['http']['header'] .= 'Cookie: ' . http_build_query($this->outgoingTrackerCookies) . "\r\n";
+                    $this->outgoingTrackerCookies = array();
+                }
+    
+                $ctx = stream_context_create($stream_options);
+                $response = file_get_contents($url, 0, $ctx);
+                $content = $response;
+    
+                $this->parseIncomingCookies($http_response_header);
             }
-
-            if (!empty($this->outgoingTrackerCookies)) {
-                $options[CURLOPT_COOKIE] = http_build_query($this->outgoingTrackerCookies);
-                $this->outgoingTrackerCookies = array();
-            }
-
-            $ch = curl_init();
-            curl_setopt_array($ch, $options);
-            ob_start();
-            $response = @curl_exec($ch);
-            ob_end_clean();
-            $header = '';
-            $content = '';
-            
-            if ($response === false) {
-                throw new \RuntimeException(curl_error($ch));
-            }
-            
-            if (!empty($response)) {
-                list($header, $content) = explode("\r\n\r\n", $response, $limitCount = 2);
-            }
-
-            $this->parseIncomingCookies(explode("\r\n", $header));
-
-        } elseif (function_exists('stream_context_create')) {
-            $stream_options = array(
-                'http' => array(
-                    'method' => $method,
-                    'user_agent' => $this->userAgent,
-                    'header' => "Accept-Language: " . $this->acceptLanguage . "\r\n",
-                    'timeout' => $this->requestTimeout,
-                ),
-            );
-
-            if (isset($proxy)) {
-                $stream_options['http']['proxy'] = $proxy;
-            }
-
-            // only supports JSON data
-            if (!empty($data) && $forcePostUrlEncoded) {
-                $stream_options['http']['header'] .= "Content-Type: application/x-www-form-urlencoded \r\n";
-                $stream_options['http']['content'] = $data;
-            } elseif (!empty($data)) {
-                $stream_options['http']['header'] .= "Content-Type: application/json \r\n";
-                $stream_options['http']['content'] = $data;
-            }
-
-            if (!empty($this->outgoingTrackerCookies)) {
-                $stream_options['http']['header'] .= 'Cookie: ' . http_build_query($this->outgoingTrackerCookies) . "\r\n";
-                $this->outgoingTrackerCookies = array();
-            }
-
-            $ctx = stream_context_create($stream_options);
-            $response = file_get_contents($url, 0, $ctx);
-            $content = $response;
-
-            $this->parseIncomingCookies($http_response_header);
-        }
-
+        } // eof default tracking code
         return $content;
     }
 
